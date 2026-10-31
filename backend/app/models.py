@@ -39,7 +39,7 @@ class Source(BaseModel):
     published_date: Optional[datetime] = None
     date_origin: Literal["meta", "jsonld", "visible_text", "url_pattern", "none"] = "none"
     date_status: Literal["fresh", "stale", "undated"] = "undated"
-    cycle_year: Optional[int] = None
+    cycle_year: Optional[str | int] = None
     fetch_status: Literal["ok", "failed", "blocked", "empty"] = "ok"
     error_message: Optional[str] = None
     passages: list[Passage] = Field(default_factory=list)
@@ -61,7 +61,7 @@ class Fact(BaseModel):
     value: Optional[str] = None
     quote: Optional[str] = None      # Verbatim quote, max 40 words
     passage_id: Optional[str] = None
-    cycle_year: Optional[int] = None
+    cycle_year: Optional[str | int] = None
     confidence: Literal["low", "medium", "high"] = "low"
     quote_verified: bool = False     # True if quote is a substring of the passage
 

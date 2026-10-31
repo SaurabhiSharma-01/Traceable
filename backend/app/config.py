@@ -35,6 +35,8 @@ class Settings(BaseSettings):
 
     SEARCH_API_KEY: str = ""
     STALE_MONTHS: int = 12
+    SEARCH_CACHE_TTL_HOURS: int = 24
+    PAGE_CACHE_TTL_HOURS: int = 24
 
 
 settings = Settings()

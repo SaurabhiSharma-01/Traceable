@@ -33,7 +33,7 @@ export interface Source {
   published_date: string | null; // ISO datetime string
   date_origin: DateOrigin;
   date_status: DateStatus;
-  cycle_year: number | null;
+  cycle_year: string | number | null;
   fetch_status: FetchStatus;
   error_message: string | null;
   passages: Passage[];
@@ -55,7 +55,7 @@ export interface Fact {
   value: string | null;
   quote: string | null;
   passage_id: string | null;
-  cycle_year: number | null;
+  cycle_year: string | number | null;
   confidence: Confidence;
   quote_verified: boolean;
 }

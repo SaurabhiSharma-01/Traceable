@@ -1,13 +1,14 @@
 """
 Traceable API — main entry point.
 
-Phase 0 scaffold: health check only.
-Feature routers (understand, sources, analyses) will be added in later phases.
+Includes health check and Phase 1+9 source acquisition endpoints.
 """
 from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from .api.sources import router as sources_router
 
 app = FastAPI(
     title="Traceable API",
@@ -22,6 +23,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(sources_router)
 
 
 @app.get("/health")
