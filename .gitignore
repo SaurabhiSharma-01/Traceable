@@ -1,0 +1,36 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.Python
+
+# ── Environment / secrets ────────────────────────────────────────────────────
+# IMPORTANT: .env.example is intentionally NOT ignored (it contains no secrets)
+.env
+.env.local
+*.env
+!.env.example
+
+# ── Databases ────────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+
+# ── Frontend / Node ──────────────────────────────────────────────────────────
+node_modules/
+dist/
+.vite/
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+*.pem
+*.log
+Thumbs.db

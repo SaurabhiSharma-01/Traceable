@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+pydantic-settings
+python-dotenv
+httpx
+trafilatura
+beautifulsoup4
+pdfplumber
+python-dateutil
+rapidfuzz
+google-genai
+aiosqlite
+tavily-python
+pytest
+pytest-asyncio
