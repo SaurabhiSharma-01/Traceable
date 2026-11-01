@@ -5,7 +5,10 @@ Phase 2 implementation:
 - Structured JSON output with Gemini via official google-genai SDK
 - Native response schema validation via Pydantic v2
 - Automatic single repair retry on schema/JSON mismatch
-- Exponential backoff with jitter on 429/5xx and timeouts
+- Thinking-config cascade per model: configured level -> LOW -> budget 0 -> omit
+  (cached in-process so the probe only happens once per model per process)
+- Exponential backoff with jitter on 429/5xx (up to 3 attempts)
+- Timeout retried at most ONCE; LLM_TIMEOUT_SECONDS default 45s
 - Concurrency control via asyncio.Semaphore
 - SQLite response caching with SHA-256 keys
 - Transparent, privacy-preserving logging (no secrets or sensitive prompt text logged)
@@ -49,6 +52,18 @@ _semaphore: Optional[asyncio.Semaphore] = None
 _initialized_dbs: set[str] = set()
 _cache_init_lock = asyncio.Lock()
 
+# ---------------------------------------------------------------------------
+# Per-model thinking-setting cache (survives the process lifetime)
+# Keys are model names; values are one of:
+#   "level:low"   — ThinkingLevel.LOW worked
+#   "budget:0"    — thinking_budget=0 worked
+#   "none"        — omit thinking_config entirely
+# ---------------------------------------------------------------------------
+_model_thinking_cache: dict[str, str] = {}
+
+# Ordered cascade of settings to try
+_THINKING_CASCADE = ["level:low", "budget:0", "none"]
+
 
 def get_client() -> Any:
     """Lazily instantiate or return the global SDK client."""
@@ -63,7 +78,6 @@ def get_client() -> Any:
     if not api_key or not api_key.strip():
         raise LLMConfigError("GEMINI_API_KEY missing or rejected; check backend/.env")
 
-    # Native google-genai SDK
     try:
         from google import genai
         _client = genai.Client(api_key=api_key.strip())
@@ -94,6 +108,7 @@ def provider_info() -> dict[str, str]:
     return {
         "provider": "gemini",
         "model": settings.GEMINI_MODEL,
+        "thinking_level": str(settings.LLM_THINKING_LEVEL),
     }
 
 
@@ -136,10 +151,11 @@ def _compute_cache_key(
     system: str,
     prompt: str,
     schema: Type[BaseModel],
+    thinking_level: str = "",
 ) -> str:
     """Compute deterministic SHA-256 cache key."""
     schema_json = json.dumps(schema.model_json_schema(), sort_keys=True)
-    raw = f"{model}:{temperature}:{system}:{prompt}:{schema_json}"
+    raw = f"{model}:{temperature}:{thinking_level}:{system}:{prompt}:{schema_json}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -165,15 +181,38 @@ def _is_auth_error(exc: Exception) -> bool:
     return "401" in msg or "403" in msg or "unauthorized" in msg or "permission denied" in msg or "invalid api key" in msg
 
 
+def _is_thinking_rejection(exc: Exception) -> bool:
+    """Return True if the model rejected the thinking config with a 400."""
+    msg = str(exc).lower()
+    is_400 = (
+        "400" in msg
+        or "invalid argument" in msg
+        or "bad request" in msg
+    )
+    is_thinking = "thinking" in msg or "thinking_config" in msg
+    return is_400 and is_thinking
+
+
 def _is_transient_error(exc: Exception) -> bool:
-    """Check if exception represents a retryable rate limit or server error."""
+    """Return True for retryable 429/5xx and server-overload errors. Excludes timeouts."""
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-        return True
+        return False  # handled separately
     status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     if status_code in (429, 500, 502, 503, 504):
         return True
     msg = str(exc).lower()
-    return any(err in msg for err in ("429", "500", "502", "503", "504", "resource exhausted", "overloaded", "quota"))
+    return any(err in msg for err in (
+        "429", "500", "502", "503", "504",
+        "resource exhausted", "overloaded", "quota", "high demand",
+    ))
+
+
+def _is_timeout(exc: Exception) -> bool:
+    """Return True for timeout errors."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    msg = str(exc).lower()
+    return "timeout" in msg or "deadline exceeded" in msg or "timed out" in msg
 
 
 def _extract_retry_after(exc: Exception) -> Optional[float]:
@@ -187,14 +226,58 @@ def _extract_retry_after(exc: Exception) -> Optional[float]:
     return None
 
 
+def _build_thinking_config_for_key(types_mod: Any, setting_key: str) -> Any:
+    """
+    Build a ThinkingConfig for a cascade setting key.
+    Returns None when the key is 'none' (omit thinking_config entirely).
+    """
+    if setting_key == "none":
+        return None
+    if setting_key == "level:low":
+        level = getattr(types_mod.ThinkingLevel, "LOW", None)
+        if level is not None:
+            return types_mod.ThinkingConfig(thinking_level=level)
+        # ThinkingLevel.LOW not available on this SDK version; fall through
+        return None
+    if setting_key.startswith("budget:"):
+        try:
+            budget = int(setting_key.split(":")[1])
+            return types_mod.ThinkingConfig(thinking_budget=budget)
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _initial_thinking_key() -> str:
+    """
+    Return the cascade starting point based on LLM_THINKING_LEVEL config.
+    Maps config string to a cascade key; unknown values default to 'level:low'.
+    """
+    level = str(settings.LLM_THINKING_LEVEL).strip().lower()
+    if level in ("none", "off", "disable", "disabled", "false"):
+        return "none"
+    if level in ("budget:0", "0"):
+        return "budget:0"
+    # Anything else (low, minimal, medium, high, etc.) maps to level:low
+    return "level:low"
+
+
 async def _call_gemini_raw(
     client: Any,
     prompt: str,
     schema: Type[BaseModel],
     system: str,
+    model: str,
 ) -> tuple[str, Optional[int]]:
-    """Invoke Gemini with structured output. Return (response_text, token_count)."""
-    # 1. Custom fake client for testing
+    """
+    Invoke Gemini with structured output. Return (response_text, token_count).
+
+    Implements thinking-config cascade:
+      - Reads cached working setting for `model` from _model_thinking_cache
+      - On 400 "thinking not supported": advances to next cascade step, caches, retries
+      - Cascade: configured -> level:low -> budget:0 -> none
+    """
+    # Fast path: fake client used in tests
     if hasattr(client, "generate_content"):
         res = client.generate_content(
             contents=prompt,
@@ -207,27 +290,73 @@ async def _call_gemini_raw(
         tokens = getattr(res, "total_tokens", None)
         return text, tokens
 
-    # 2. Native google-genai SDK client
+    # Native google-genai SDK
     from google.genai import types
 
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=schema,
-        temperature=settings.LLM_TEMPERATURE,
-        system_instruction=system if system else None,
-    )
-
     def _sync_call() -> tuple[str, Optional[int]]:
-        resp = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-            config=config,
-        )
-        t = (resp.text or "").strip()
-        tokens = None
-        if hasattr(resp, "usage_metadata") and resp.usage_metadata is not None:
-            tokens = getattr(resp.usage_metadata, "total_token_count", None)
-        return t, tokens
+        # Determine starting cascade position for this model
+        if model in _model_thinking_cache:
+            start_key = _model_thinking_cache[model]
+        else:
+            start_key = _initial_thinking_key()
+
+        # Build the cascade from the starting point
+        try:
+            start_idx = _THINKING_CASCADE.index(start_key)
+        except ValueError:
+            start_idx = 0
+        cascade = _THINKING_CASCADE[start_idx:]
+
+        last_exc: Optional[Exception] = None
+        for setting_key in cascade:
+            thinking_cfg = _build_thinking_config_for_key(types, setting_key)
+
+            config_kwargs: dict[str, Any] = {
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+                "temperature": settings.LLM_TEMPERATURE,
+                "system_instruction": system if system else None,
+            }
+            if thinking_cfg is not None:
+                config_kwargs["thinking_config"] = thinking_cfg
+
+            config = types.GenerateContentConfig(**config_kwargs)
+
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                # Success — cache working setting
+                if _model_thinking_cache.get(model) != setting_key:
+                    _model_thinking_cache[model] = setting_key
+                    logger.info(
+                        "[LLM] Cached thinking setting for model %r: %r",
+                        model, setting_key,
+                    )
+                t = (resp.text or "").strip()
+                tokens = None
+                if hasattr(resp, "usage_metadata") and resp.usage_metadata is not None:
+                    tokens = getattr(resp.usage_metadata, "total_token_count", None)
+                return t, tokens
+
+            except Exception as exc:
+                if _is_thinking_rejection(exc):
+                    logger.warning(
+                        "[LLM] Model %r rejected thinking setting %r (%s). Trying next cascade step...",
+                        model, setting_key, type(exc).__name__,
+                    )
+                    last_exc = exc
+                    # Advance cascade — do NOT retry this call; continue to next setting
+                    continue
+                # Non-thinking error — propagate immediately
+                raise
+
+        # Exhausted cascade
+        raise LLMUnavailableError(
+            f"Model {model!r} rejected all thinking settings. Last error: {last_exc}"
+        ) from last_exc
 
     return await asyncio.to_thread(_sync_call)
 
@@ -239,6 +368,7 @@ async def generate_json(
     *,
     cache: bool = True,
     task: str = "generic",
+    model: Optional[str] = None,
 ) -> T:
     """Generate structured JSON conforming to `schema` using Gemini.
 
@@ -248,20 +378,34 @@ async def generate_json(
       system: Optional system instruction.
       cache: Whether to read/write response from SQLite cache (default True).
       task: Label for telemetry/logging (e.g. "extraction", "understand").
+      model: Optional model name override (defaults to settings.GEMINI_MODEL).
 
     Returns:
       Validated instance of `schema`.
+
+    Retry policy:
+      - 429 / 5xx (transient): up to 3 attempts with exponential backoff
+      - Timeout: retried ONCE (at most 2 total calls)
+      - 400 thinking rejection: cascade handled inside _call_gemini_raw (not a retry here)
+      - Auth errors: raised immediately, no retry
     """
     if settings.LLM_PROVIDER != "gemini":
         raise LLMConfigError(f"Only 'gemini' is implemented (configured: {settings.LLM_PROVIDER!r})")
 
     db_path = settings.SQLITE_DB_PATH
-    model = settings.GEMINI_MODEL
+    active_model = model or settings.GEMINI_MODEL
     temp = settings.LLM_TEMPERATURE
     use_cache = cache and settings.LLM_CACHE_ENABLED
 
     # Cache lookup
-    cache_key = _compute_cache_key(model, temp, system, prompt, schema)
+    cache_key = _compute_cache_key(
+        active_model,
+        temp,
+        system,
+        prompt,
+        schema,
+        str(settings.LLM_THINKING_LEVEL),
+    )
     if use_cache:
         await _init_cache_table(db_path)
         try:
@@ -277,7 +421,7 @@ async def generate_json(
                         logger.info(
                             "[LLM] task=%s model=%s cache=HIT latency_ms=0.0 attempts=0",
                             task,
-                            model,
+                            active_model,
                         )
                         return validated
         except Exception as e:
@@ -297,51 +441,22 @@ async def generate_json(
         repair_attempted = False
 
         while True:
-            # Outer transient retry loop (up to 3 attempts total)
-            attempt_exc: Optional[Exception] = None
-            for transient_attempt in range(1, 4):
-                attempts += 1
-                try:
-                    raw_response_text, total_tokens = await asyncio.wait_for(
-                        _call_gemini_raw(client, current_prompt, schema, system),
-                        timeout=settings.LLM_TIMEOUT_SECONDS,
-                    )
-                    attempt_exc = None
-                    break
-                except Exception as exc:
-                    attempt_exc = exc
-                    if _is_auth_error(exc):
-                        raise LLMConfigError("GEMINI_API_KEY missing or rejected; check backend/.env") from exc
+            # ------------------------------------------------------------------
+            # Outer loop: schema validation + repair retry (max 2 passes)
+            # ------------------------------------------------------------------
+            raw_response_text, total_tokens = await _call_with_retry(
+                client, current_prompt, schema, system, active_model,
+                start_time, task, attempts,
+            )
+            # _call_with_retry updates attempts internally via side-effect
+            # (we use a mutable container to track it cleanly)
+            attempts = _attempt_counter[0]
 
-                    if _is_transient_error(exc):
-                        if transient_attempt < 3:
-                            delay = _extract_retry_after(exc)
-                            if delay is None:
-                                delay = (2 ** (transient_attempt - 1)) + random.uniform(0.1, 0.5)
-                            logger.warning(
-                                "[LLM] Transient error attempt %d/3 (%s). Backing off %.2fs...",
-                                transient_attempt,
-                                type(exc).__name__,
-                                delay,
-                            )
-                            await asyncio.sleep(delay)
-                            continue
-                        else:
-                            raise LLMUnavailableError(
-                                f"Service unavailable after {transient_attempt} attempts: {exc}"
-                            ) from exc
-                    # Other unknown fatal error
-                    raise exc
-
-            if attempt_exc is not None:
-                raise LLMUnavailableError(f"LLM call failed: {attempt_exc}") from attempt_exc
-
-            # Parsing and schema validation
             cleaned = _clean_json_output(raw_response_text)
             try:
                 parsed_dict = json.loads(cleaned)
                 validated_obj = schema.model_validate(parsed_dict)
-                break  # Successful parsing and validation!
+                break  # success
             except (json.JSONDecodeError, ValidationError) as parse_err:
                 if not repair_attempted:
                     repair_attempted = True
@@ -352,7 +467,7 @@ async def generate_json(
                         f"Your previous output was invalid: {err_preview}. "
                         "Return only valid JSON matching the schema."
                     )
-                    continue  # Run the loop once more with repair prompt
+                    continue
                 else:
                     raise LLMOutputError(
                         f"Validation failed after repair retry: {parse_err}"
@@ -372,21 +487,97 @@ async def generate_json(
                     INSERT OR REPLACE INTO llm_cache (key, response_json, model, created_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (cache_key, payload, model, now_iso),
+                    (cache_key, payload, active_model, now_iso),
                 )
                 await db.commit()
         except Exception as cache_err:
             logger.warning("[LLM] Failed to write cache: %s", cache_err)
 
-    # Logging telemetry
     tokens_str = f" tokens={total_tokens}" if total_tokens is not None else ""
     logger.info(
         "[LLM] task=%s model=%s cache=MISS latency_ms=%.1f attempts=%d%s",
         task,
-        model,
+        active_model,
         latency_ms,
         attempts,
         tokens_str,
     )
 
-    return validated_obj
+    return validated_obj  # type: ignore[return-value]
+
+
+# Mutable counter so _call_with_retry can update it without non-local
+_attempt_counter: list[int] = [0]
+
+
+async def _call_with_retry(
+    client: Any,
+    prompt: str,
+    schema: Type[BaseModel],
+    system: str,
+    model: str,
+    start_time: float,
+    task: str,
+    initial_attempts: int,
+) -> tuple[str, Optional[int]]:
+    """
+    Call _call_gemini_raw with retry policy:
+      - transient (429/5xx): up to 3 total attempts, exponential backoff
+      - timeout: at most 1 retry (2 total calls)
+      - auth error: raise immediately
+      - other: raise immediately
+    """
+    _attempt_counter[0] = initial_attempts
+    timeout_attempts = 0
+    transient_attempts = 0
+
+    while True:
+        _attempt_counter[0] += 1
+        try:
+            result = await asyncio.wait_for(
+                _call_gemini_raw(client, prompt, schema, system, model),
+                timeout=settings.LLM_TIMEOUT_SECONDS,
+            )
+            return result
+
+        except Exception as exc:
+            if _is_auth_error(exc):
+                raise LLMConfigError("GEMINI_API_KEY missing or rejected; check backend/.env") from exc
+
+            if _is_timeout(exc):
+                timeout_attempts += 1
+                if timeout_attempts <= 1:
+                    logger.warning(
+                        "[LLM] Call timed out after %.0fs (attempt %d). Retrying once...",
+                        settings.LLM_TIMEOUT_SECONDS,
+                        _attempt_counter[0],
+                    )
+                    continue  # one retry for timeout
+                else:
+                    raise LLMUnavailableError(
+                        f"LLM call timed out after {settings.LLM_TIMEOUT_SECONDS:.0f}s "
+                        f"on both attempts."
+                    ) from exc
+
+            if _is_transient_error(exc):
+                transient_attempts += 1
+                if transient_attempts < 3:
+                    delay = _extract_retry_after(exc)
+                    if delay is None:
+                        delay = (2 ** (transient_attempts - 1)) + random.uniform(0.1, 0.5)
+                    logger.warning(
+                        "[LLM] Transient error attempt %d/3 (%s: %s). Backing off %.2fs...",
+                        _attempt_counter[0],
+                        type(exc).__name__,
+                        str(exc)[:80],
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    raise LLMUnavailableError(
+                        f"Service unavailable after {transient_attempts} attempts: {exc}"
+                    ) from exc
+
+            # Unknown / fatal error
+            raise

@@ -1,15 +1,27 @@
-// Phase 0 shell — shows only the app name.
-// Full routing and screens will be built in later phases.
+import React from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { AnalysisDraftProvider } from './state/AnalysisDraftContext';
+import { AppShell } from './components/layout/AppShell';
+import { HomePage } from './pages/HomePage';
+import { ConfirmTopicsPage } from './pages/ConfirmTopicsPage';
+import { SourcesPlaceholderPage } from './pages/SourcesPlaceholderPage';
+import { NotFoundPage } from './pages/NotFoundPage';
 
-function App() {
+export function App() {
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <h1 className="text-4xl font-bold text-slate-800 tracking-tight">
-        Traceable
-      </h1>
-    </div>
-  )
+    <BrowserRouter>
+      <AnalysisDraftProvider>
+        <AppShell>
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/topics" element={<ConfirmTopicsPage />} />
+            <Route path="/sources" element={<SourcesPlaceholderPage />} />
+            <Route path="*" element={<NotFoundPage />} />
+          </Routes>
+        </AppShell>
+      </AnalysisDraftProvider>
+    </BrowserRouter>
+  );
 }
 
-export default App
-
+export default App;

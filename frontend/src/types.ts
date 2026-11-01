@@ -44,6 +44,17 @@ export interface ExpectedTopic {
   label: string;        // Human-readable, e.g. "Eligibility Criteria"
   importance: number;   // 1–5
   description: string;
+  is_critical?: boolean;
+}
+
+export interface UnderstandingResult {
+  entity: string | null;
+  entity_type: string | null;
+  intent: string;
+  expected_topics: ExpectedTopic[];
+  ambiguity_note: string | null;
+  needs_clarification: boolean;
+  clarification_question: string | null;
 }
 
 export type Confidence = 'low' | 'medium' | 'high';

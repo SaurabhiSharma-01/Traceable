@@ -262,3 +262,24 @@ async def test_keys_with_aq_and_aiza_accepted(monkeypatch: pytest.MonkeyPatch):
     set_client(fake2)
     res_aiza = await generate_json("Query AIza", SampleItem, cache=False)
     assert res_aiza.name == "AIza_Key"
+
+
+def test_thinking_budget_configuration_and_provider_info(monkeypatch: pytest.MonkeyPatch):
+    from app.llm.provider import provider_info, _build_thinking_config
+    from google.genai import types
+
+    monkeypatch.setattr(settings, "LLM_THINKING_BUDGET", "minimal")
+    info = provider_info()
+    assert info["provider"] == "gemini"
+    assert info["thinking_budget"] == "minimal"
+
+    cfg_minimal = _build_thinking_config(types, "minimal")
+    assert cfg_minimal is not None
+
+    cfg_int = _build_thinking_config(types, "100")
+    assert cfg_int is not None
+    assert cfg_int.thinking_budget == 100
+
+    cfg_off = _build_thinking_config(types, "off")
+    assert cfg_off is not None
+    assert cfg_off.thinking_budget == 0

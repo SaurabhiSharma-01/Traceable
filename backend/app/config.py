@@ -7,7 +7,11 @@ Environment variables (set in backend/.env, never committed):
   GEMINI_MODEL        — model to use (default: gemini-2.5-flash)
   LLM_TEMPERATURE     — generation temperature (default: 0.1)
   LLM_MAX_CONCURRENCY — max parallel requests to the LLM (default: 3)
-  LLM_TIMEOUT_SECONDS — timeout per LLM call (default: 60)
+  LLM_TIMEOUT_SECONDS — per-call timeout; timeouts retried once (default: 45)
+  LLM_THINKING_LEVEL  — thinking cascade start: "low" | "budget:0" | "none" (default: low)
+                        "low"      -> try ThinkingLevel.LOW first, then budget:0, then none
+                        "budget:0" -> try thinking_budget=0 first, then none
+                        "none"     -> omit thinking_config entirely
   LLM_CACHE_ENABLED   — whether response caching in SQLite is enabled (default: True)
   SQLITE_DB_PATH      — path to SQLite db for caching & storage (default: traceable.sqlite)
   SEARCH_API_KEY      — key for Tavily search (https://app.tavily.com)
@@ -29,7 +33,8 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-2.5-flash"
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_CONCURRENCY: int = 3
-    LLM_TIMEOUT_SECONDS: float = 60.0
+    LLM_TIMEOUT_SECONDS: float = 45.0
+    LLM_THINKING_LEVEL: str = "low"
     LLM_CACHE_ENABLED: bool = True
     SQLITE_DB_PATH: str = "traceable.sqlite"
 

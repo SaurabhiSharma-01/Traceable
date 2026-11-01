@@ -306,7 +306,9 @@ async def test_search_provider_success(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_search_provider_missing_key():
+async def test_search_provider_missing_key(monkeypatch):
+    # Ensure no real key from .env can bleed in
+    monkeypatch.setattr(settings, "SEARCH_API_KEY", "")
     provider = TavilySearchProvider(api_key="")
     with pytest.raises(SearchConfigError) as exc_info:
         await provider.search("query", use_cache=False)

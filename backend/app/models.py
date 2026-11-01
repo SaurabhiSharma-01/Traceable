@@ -9,10 +9,10 @@ Section 8 of SPEC.md defines the contract — change both files together.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +49,17 @@ class ExpectedTopic(BaseModel):
     """A topic the analysis is expected to find information about."""
     key: str                 # e.g. "eligibility_criteria"
     label: str               # Human-readable label, e.g. "Eligibility Criteria"
-    importance: int = Field(ge=1, le=5)
+    importance: int = Field(default=3)  # clamped to 1-5 by clamp_importance validator
     description: str
+    is_critical: bool = False
+
+    @field_validator("importance", mode="before")
+    @classmethod
+    def clamp_importance(cls, v: Any) -> int:
+        try:
+            return max(1, min(5, int(v)))
+        except (ValueError, TypeError):
+            return 3
 
 
 class Fact(BaseModel):

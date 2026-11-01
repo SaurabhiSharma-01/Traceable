@@ -24,6 +24,7 @@ from .fetch_clean import (
     validate_url_safety,
 )
 from .queries import generate_queries
+from .query_understanding import UnderstandingResult, understand
 from .search import SearchProvider, SearchResult, TavilySearchProvider, search
 from .source_acquisition import collect_candidates, normalize_url
 
@@ -47,6 +48,8 @@ __all__ = [
     "source_from_text",
     "validate_url_safety",
     "generate_queries",
+    "UnderstandingResult",
+    "understand",
     "SearchProvider",
     "SearchResult",
     "TavilySearchProvider",
